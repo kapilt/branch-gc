@@ -2,7 +2,8 @@
 
 I kept accumulating branches either pushed to github or in my local dev
 environments that were stale, they'd already been merged upstream, but
-accumulated over time. I wrote this script as a utility to tidy up, hope
+accumulated over time. I wrote this script as a utility to tidy up, 
+hopefully its useful.
 
 
 # Install
