@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""
+Utility Script for tidying up git(hub) branches
+
+For local branches, it will look for corresponding pull-requests
+that have been merged and then remove the local branch.
+
+For github branches on a fork, it will query for branches that
+have been merged via pull-request, and then remove them.
+"""
+
+import click
+from collections import Counter
+from datetime import datetime, timedelta
+from dateutil.parser import parse as parse_date
+from dateutil.tz import tzutc
+import getpass
+import jmespath
+import logging
+import pygit2
+import requests
+import os
+
+log = logging.getLogger('branch-gc')
+
+query_pull_requests = """
+query($cursor: String, $owner: String!, $repo: String!) {
+  repository(name: $repo, owner: $owner) {
+    pullRequests(first: 100, after: $cursor, states: [MERGED], orderBy: {field: CREATED_AT, direction: DESC}) {
+      pageInfo {
+        endCursor
+        hasNextPage
+      }
+      nodes {
+        number
+        title
+        createdAt
+        closedAt
+        updatedAt
+        headRefName
+        headRepositoryOwner {
+          login
+        }
+      }
+    }
+  }
+}
+"""
+
+query_user_branches = """
+query($cursor: String, $owner: String!, $repo: String!) {
+  repository(owner: $owner, name: $repo) {
+    refs(first: 100, refPrefix:"refs/heads/", after: $cursor) {
+      pageInfo {
+        endCursor
+        hasNextPage
+      }
+      nodes {
+        name
+        target {oid}
+        associatedPullRequests(states: MERGED, first: 5) {
+          totalCount
+          nodes {
+            baseRefName
+            repository {              
+              name
+              owner {
+                login
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+class Github(object):
+
+    def __init__(self, token, endpoint):
+        self.token = token
+        self.url = endpoint
+        self.v3_url = 'https://api.github.com'
+
+    def iter_merged_branches(self, owner, repo):
+        headers = {"Authorization": "token {}".format(self.token)}
+        next_cursor = None
+
+        while next_cursor is not False:
+            params = {
+                'query': query_user_branches,
+                'variables': {
+                    'owner': owner,
+                    'repo': repo,
+                    'cursor': next_cursor}}
+
+            response = requests.post(self.url, headers=headers, json=params)
+            result = response.json()
+            if response.status_code != 200 or 'errors' in result:
+                raise ValueError("Github api error %s" % (
+                    response.content.decode('utf8'),))
+
+            branches = jmespath.search('data.repository.refs.nodes', result)
+
+            for b in branches:
+                if b['associatedPullRequests']['totalCount']:
+                    yield b
+
+            page_info = jmespath.search(
+                'data.repository.refs.pageInfo', result)            
+            if page_info:
+                next_cursor = (page_info['hasNextPage'] and
+                               page_info['endCursor'] or False)
+            else:
+                next_cursor = False        
+
+    def iter_merged_prs(self, owner, repo, max_days=30, author=None):
+        headers = {"Authorization": "token {}".format(self.token)}
+        next_cursor = None
+        cutoff_date = None
+
+        if max_days:
+            cutoff_date = datetime.utcnow().replace(
+                tzinfo=tzutc()) - timedelta(days=max_days)
+
+        while next_cursor is not False:
+            params = {
+                'query': query_pull_requests,
+                'variables': {
+                    'owner': owner,
+                    'repo': repo,
+                    'cursor': next_cursor}}
+
+            response = requests.post(self.url, headers=headers, json=params)
+            result = response.json()
+            if response.status_code != 200 or 'errors' in result:
+                raise ValueError("Github api error %s" % (
+                    response.content.decode('utf8'),))
+
+            pull_requests = jmespath.search(
+                'data.repository.pullRequests.nodes', result)
+            for pr in pull_requests:
+                if cutoff_date and parse_date(pr['closedAt']) < cutoff_date:
+                    return
+                if author and pr['headRepositoryOwner']['login'] == author:
+                    yield pr
+
+            page_info = jmespath.search(
+                'data.repository.pullRequests.pageInfo', result)            
+            if page_info:
+                next_cursor = (page_info['hasNextPage'] and
+                               page_info['endCursor'] or False)
+            else:
+                next_cursor = False
+
+    def delete_branch(self, owner, repo, branch):
+        headers = {"Authorization": "token {}".format(self.token)}        
+        url = '{base_url}/repos/{owner}/{repo}/git/refs/heads/{branch_name}'.format(
+            base_url=self.v3_url, owner=owner, repo=repo,
+            branch_name=branch['name'])
+        response = requests.delete(url, headers=headers)
+        if response.status_code != 204:
+            print(response.content.decode('utf8'))
+
+
+@click.group(help=__doc__)
+def cli():
+    """Git(Hub) Branch GC Utility"""
+
+
+@cli.command(name='github')
+@click.option('--github-url', envvar="GITHUB_API_URL",
+              default='https://api.github.com/graphql')
+@click.option('--github-token', envvar='GITHUB_TOKEN',
+              help="Github credential token")
+@click.option('--repo', help="Github repo name")
+@click.option('--author', help="Author github login")
+@click.option('--dry-run', default=False, help="Dry Run", is_flag=True)
+@click.option('--limit', default=0, type=int) 
+def gc_github_branches(github_url, github_token, repo, author, dry_run, limit):
+    """Garbage collect merged github branches"""
+    gh = Github(github_token, github_url)
+    stats = Counter()
+    for stale_branch in gh.iter_merged_branches(author, repo):
+        stats['stale'] += 1
+        if limit and stats['stale'] > limit:
+            break
+        log.info("gc %s", stale_branch)
+        if not dry_run:
+            gh.delete_branch(author, repo, stale_branch)
+
+
+@cli.command(name='local')
+@click.option(
+    '--remote', default='origin',
+    help="Which remote references the fork where branches are pushed")
+@click.option('--path', help="Repository Directory",
+              default=os.getcwd(), type=click.Path())
+@click.option('--owner', help="Github Upstream Repo Owner", required=True)
+@click.option('--repo', help="Github Repository Name", required=True)
+@click.option('--author', default=getpass.getuser())
+@click.option('--limit', default=0, type=int) 
+@click.option('--max-days', default=30, type=int,
+              help="Only considered pull requests from the last n days")
+@click.option('--github-url', envvar="GITHUB_API_URL",
+              default='https://api.github.com/graphql')
+@click.option('--github-token', envvar='GITHUB_TOKEN',
+              help="Github credential token")
+@click.option('--dry-run', default=False, help="Dry Run", is_flag=True)
+def gc_local_branches(
+        remote, path, owner, repo, author, limit, max_days,
+        github_url, github_token, dry_run):
+    """Garbage collect merged local branches"""
+    logging.basicConfig(level=logging.INFO)
+    stats = Counter()
+    gh = Github(github_token, github_url)
+
+    prs = {}
+    for pr in gh.iter_merged_prs(owner, repo, max_days, author):
+        stats['merged-prs'] += 1
+        prs[pr['headRefName']] = pr
+
+    remote_prefix = "refs/remotes/{}/".format(remote)
+    local_repo = pygit2.Repository(path)
+    remotes = {r.name: r for r in local_repo.remotes}
+    branches = {}
+    for local_branch in local_repo.branches.local:
+        branch = local_repo.branches.get(local_branch)
+        stats['total'] += 1
+        try:
+            if not branch.upstream_name.startswith(remote_prefix):
+                stats['skipped'] += 1
+                continue
+            stats['matched'] += 1
+        except (pygit2.InvalidSpecError, KeyError):
+            stats['error'] += 1
+            continue
+        branches[branch.name[len('refs/heads/'):]] = branch
+
+    stale_branches = set(prs).intersection(branches)
+    stats['stale'] += len(stale_branches)
+    log.info("Found %d stale branches from: %d prs and %d local branches",
+             stats['stale'], len(prs), len(branches))
+
+    for branch_name in prs:
+        if branch_name not in branches:
+            continue
+        pr =  prs[branch_name]
+        log.info("Stale branch %s merged %s in %s: %s",
+                 branch_name, pr['closedAt'], pr['number'], pr['title'])
+        if not dry_run:
+            local_repo.references.delete('refs/heads/%s' % branch_name)
+
+
+
+if __name__ == '__main__':
+    try:
+        cli()
+    except Exception:
+        import traceback, pdb, sys
+        traceback.print_exc()
+        pdb.post_mortem(sys.exc_info()[-1])
+
+    
+    

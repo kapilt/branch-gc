@@ -1,0 +1,8 @@
+click
+pygit2
+python-dateutil
+jmespath
+requests
+
+
+
