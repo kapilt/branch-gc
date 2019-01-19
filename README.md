@@ -5,6 +5,13 @@ environments that were stale, they'd already been merged upstream, but
 accumulated over time. I wrote this script as a utility to tidy up, 
 hopefully its useful.
 
+The workflow case its targeting is a project repo, with protected master,
+and users contributing branches from forks, with squashed commits on the pr.
+This seems to cause some confusion for alot of git tools on whether the
+branch is merged since the branch commits are not on the mainline. This utility
+instead queries github apis to determine if a pull request existed that
+merged the branch.
+
 
 # Install
 
@@ -39,4 +46,16 @@ Options:
 Commands:
   github  Garbage collect merged github branches
   local   Garbage collect merged local branches
+```
+
+Example cleanup github branches in a fork, all commands support dryrun
+
+```
+branch-gc github --repo cloud-custodian
+```
+
+Example cleanup local branches in a repo by examining prs merged over the last 90 days
+
+```
+branch-gc local --repo cloud-custodian --owner cloud-custodian --max-days=90
 ```
